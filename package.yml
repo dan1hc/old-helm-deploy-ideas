@@ -1,0 +1,58 @@
+stages:
+    - test
+    - build
+    - publish
+
+variables:
+  EXTRA_INDEX_URL : https://pypi.python.org/simple
+  VERSION         : $VERSION_MAJOR.$VERSION_MINOR.$CI_PIPELINE_IID
+  # expects:
+    # VERSION_MAJOR  # 0
+    # VERSION_MINOR  # 0
+    # $EXTRA_INDEX_URL  # optional
+
+._base:
+    image: $PLATFORMAGE_URL/$PLATFORMAGE_PREFIX:latest
+
+._build:
+    extends: ._base
+    before_script:
+        - pip install -r requirements.txt --extra-index-url $EXTRA_INDEX_URL
+        - pip install .
+
+
+test:
+    extends: ._build
+    stage: test
+    environment:
+        name: dev
+    script:
+        - pip install pytest
+        - pytest -v tests/unit.py
+        - pytest -v tests/integration.py
+
+
+build:
+    extends: ._build
+    stage: build
+    artifacts:
+        paths:
+        - dist/*
+        expire_in: 1 week
+    needs: [test]
+    script:
+        - python setup.py sdist bdist_wheel
+
+
+publish:
+    extends: ._base
+    stage: publish
+    needs: [build]
+    dependencies: [build]
+    variables:
+      TWINE_USERNAME       : gitlab-ci-token
+      TWINE_PASSWORD       : $CI_JOB_TOKEN
+      TWINE_REPOSITORY_URL : $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/pypi
+    script:
+        - pip install -U twine
+        - twine upload --non-interactive dist/*

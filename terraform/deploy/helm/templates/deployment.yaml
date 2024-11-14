@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: {{ .Values.deployment.name }}
+    namespace: {{ .Values.deployment.namespace }}
+    annotations:
+        {{- range $key, $value := .Values.deployment.annotations }}
+            {{ $key }}: {{ $value | quote }}
+        {{- end}}
+spec:
+    replicas: {{ .Values.deployment.replicaCount }}
+    strategy:
+        type: {{ .Values.deployment.spec.strategy.type }}
+        rollingUpdate:
+            maxSurge: {{ .Values.deployment.spec.strategy.rollingUpdate.maxSurge }}
+            maxUnavailable: {{ .Values.deployment.spec.strategy.rollingUpdate.maxUnavailable }}
+    selector:
+        matchLabels:
+            app: {{ .Values.deployment.image.name }}
+    template:
+        metadata:
+            labels:
+                app: {{ .Values.deployment.image.name }}
+        spec:
+            containers:
+              - name: {{ .Values.deployment.name }}
+                image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+                imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+                env:
+                    {{- range $key, $value := .Values.deployment.environment }}
+                      - name: {{ $key | upper }}
+                        value: {{ $value | quote }}
+                    {{- end}}
+                    {{- range $key, $value := .Values.deployment.extra_environment }}
+                      - name: {{ $key | upper }}
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: {{ $value | quote }}
+                    {{- end}}
+                    {{- range $key, $value := .Values.secrets.secrets }}
+                      - name: {{ $key | upper }}
+                        valueFrom:
+                          secretKeyRef:
+                            key: {{ $key | lower }}
+                            name: general-secrets
+                    {{- end}}
+                ports:
+                    - containerPort: {{ .Values.service.internalPort }}
+                resources:
+                    requests:
+                        cpu: {{ .Values.deployment.spec.strategy.resources.requests.cpu }}
+                        memory: {{ .Values.deployment.spec.strategy.resources.requests.memory }}
+                readinessProbe:
+                    httpGet:
+                        path: {{ .Values.probes.readiness.path }}
+                        port: {{ .Values.service.internalPort }}
+                livenessProbe:
+                    httpGet:
+                        path: {{ .Values.probes.liveness.path }}
+                        port: {{ .Values.service.internalPort }}
+                startupProbe:
+                    httpGet:
+                        path: {{ .Values.probes.startup.path }}
+                        port: {{ .Values.service.internalPort }}
+                    initialDelaySeconds: {{ .Values.service.initialDelaySeconds }}
+                    failureThreshold: {{ .Values.service.failureThreshold }}
+                    periodSeconds: {{ .Values.service.periodSeconds }}

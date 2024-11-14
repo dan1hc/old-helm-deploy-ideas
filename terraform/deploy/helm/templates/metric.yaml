@@ -1,0 +1,7 @@
+apiVersion: datadoghq.com/v1alpha1
+kind: DatadogMetric
+metadata:
+    name: {{ .Values.datadog.name }}
+    namespace: {{ .Values.datadog.namespace }}
+spec:
+    query: {{ .Values.datadog.query }}

@@ -1,0 +1,337 @@
+stages:
+  - test
+  - build
+  - publish
+  - dockerize
+  - build dev
+  - publish dev
+  - install dev
+  - monitor dev
+  - build prod
+  - publish prod
+  - install prod
+  - monitor prod
+
+variables:
+  TF_VAR_aws_access_key_id       : $AWS_ACCESS_KEY_ID
+  TF_VAR_aws_region              : $AWS_DEFAULT_REGION
+  TF_VAR_aws_secret_access_key   : $AWS_SECRET_ACCESS_KEY
+  TF_VAR_chart_version           : $VERSION
+  TF_VAR_company                 : $COMPANY
+  TF_VAR_cpu                     : 250m
+  TF_VAR_datadog_api_key         : $DATADOG_API_KEY
+  TF_VAR_datadog_app_key         : $DATADOG_APP_KEY
+  TF_VAR_env                     : $CI_ENVIRONMENT_SLUG
+  TF_VAR_image_tag               : $IMAGE_TAG
+  TF_VAR_memory                  : 512Mi
+  TF_VAR_monitor_threshold       : "0.3"
+  TF_VAR_opsgenie_tag            : $TEAMNAME
+  TF_VAR_replica_min             : "1"
+  TF_VAR_replica_max             : "36"
+  TF_VAR_replica_desired         : "1"
+  TF_VAR_scale_threshold         : "1000"
+  TF_VAR_scan_up_freq            : "12"
+  TF_VAR_scan_down_freq          : "64"
+  TF_VAR_security_group          : elb-sg
+  TF_VAR_service_name            : $SERVICE_NAME
+  TF_VAR_state_bucket            : $S3_BUCKET_BACKEND
+  TF_VAR_state_key               : eks-nodes-eks-dev
+  TF_VAR_stagger_down_freq       : "32"
+  TF_VAR_team_name               : $TEAMNAME
+  TF_VAR_token                   : $GITLAB_SUPPORT_TOKEN
+  TF_VAR_url                     : $URL
+  IMAGE_TAG                      : $SERVICE_NAME-$VERSION
+  CI_PATH                        : 1howardcapital/application/cicd
+  CLUSTER_NAME                   : $PRIMARY_CLUSTER_NAME-dev
+  HEALTHZ_URL                    : https://$URL/healthz/synthetic
+  GITLAB_REGISTRY                : registry.gitlab.com
+  URL                            : $SERVICE_NAME-$CI_ENVIRONMENT_SLUG.$COMPANY.com
+  VERSION                        : $VERSION_MAJOR.$VERSION_MINOR.$CI_PIPELINE_IID
+  # expects:
+    # SERVICE_NAME  # CI_PROJECT_NAME
+    # GITLAB_PREFIX  # CI_PROJECT_PATH
+    # VERSION_MAJOR  # 0
+    # VERSION_MINOR  # 0
+    # INDEX_URL # https://__token__:${TOKEN}@$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/pypi
+
+image: $PLATFORMAGE_URL/$PLATFORMAGE_PREFIX:latest
+
+
+._dev:
+  needs: [dockerize]
+  environment:
+    name: dev
+
+
+._prod:
+  needs: [monitor dev]
+  environment:
+    name: prod
+
+
+._gitlab_auth:
+  before_script:
+    - docker login $GITLAB_REGISTRY -u $GITLAB_USER_LOGIN -p $GITLAB_SUPPORT_TOKEN
+
+._docker:
+  image: docker:18.09.7
+  variables:
+    DOCKER_HOST : tcp://docker:2375
+  services:
+    - docker:18.09.7-dind
+
+dockerize:
+  stage: dockerize
+  extends: 
+    - ._gitlab_auth
+    - ._docker
+  script:
+    - cd $CI_PROJECT_DIR
+    - cp requirements.txt container
+    - cd container
+    - docker build -t $IMAGE_TAG . --build-arg PACKAGE=$SERVICE_NAME --build-arg INDEX_URL=$INDEX_URL --build-arg EXTRA_INDEX_URL=$EXTRA_INDEX_URL
+    - docker tag $IMAGE_TAG $GITLAB_REGISTRY/$GITLAB_PREFIX:$IMAGE_TAG
+    - docker push $GITLAB_REGISTRY/$GITLAB_PREFIX:$IMAGE_TAG
+    - docker logout $GITLAB_REGISTRY
+
+
+._terraform_deploy:
+  variables:
+    MODULE_DIR : deploy
+  before_script:
+    - echo -e "credentials \"$CI_SERVER_HOST\" {\n  token = \"$ROOT_DEPLOY_TOKEN\"\n}" > ~/.terraformrc
+    - export TF_CLI_ARGS_init="-backend-config=bucket=${S3_BUCKET_BACKEND}"
+    - export TF_CLI_ARGS_init="${TF_CLI_ARGS_init} -backend-config=key=${CI_PROJECT_NAME}-${MODULE_DIR}-${CI_ENVIRONMENT_SLUG}"
+    - export TF_CLI_ARGS_init="${TF_CLI_ARGS_init} -backend-config=region=${AWS_DEFAULT_REGION}"
+    - aws eks update-kubeconfig --name $CLUSTER_NAME
+    - git clone --depth 50 https://gitlab-ci-token:$GITLAB_SUPPORT_TOKEN@$CI_SERVER_HOST/$CI_PATH.git $(basename $CI_PATH)
+    - cd $(basename $CI_PATH)/terraform/$MODULE_DIR
+    - export AWS_ACCOUNT_NUMBER=$(aws sts get-caller-identity | jq .Account -r)
+    - export REGISTRY=$AWS_ACCOUNT_NUMBER.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+    - export TF_VAR_registry=$REGISTRY
+    - terraform init
+    - terraform validate
+
+._build_terraform:
+  artifacts:
+    paths:
+    - values.yaml
+    - Chart.yaml
+    expire_in: 1 week
+  extends: ._terraform_deploy
+  script:
+    - terraform plan -out "planfile"
+    - terraform apply -input=false "planfile"
+    - mv helm/values.yaml $CI_PROJECT_DIR/values.yaml
+    - mv helm/Chart.yaml $CI_PROJECT_DIR/Chart.yaml
+    - cd $CI_PROJECT_DIR
+
+._destroy_terraform:
+  when: manual
+  extends: ._terraform_deploy
+  script:
+    - aws ecr delete-repository --repository-name $SERVICE_NAME-$CI_ENVIRONMENT_SLUG --force
+    - terraform destroy -auto-approve
+
+build dev:
+  stage: build dev
+  extends:
+    - ._dev
+    - ._build_terraform
+  environment:
+    on_stop: destroy dev
+  
+destroy dev:
+  stage: build dev
+  extends:
+    - ._dev
+    - ._destroy_terraform
+  environment:
+    action: stop
+
+
+._publish:
+  extends: ._docker
+  before_script:
+    - apk add --no-cache python3 py3-pip
+    - pip3 install --upgrade pip
+    - pip3 install --no-cache-dir awscli
+    - export AWS_ACCOUNT_NUMBER=$(aws sts get-caller-identity --query Account --output text)
+    - export REGISTRY=$AWS_ACCOUNT_NUMBER.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  script:
+    - docker login $GITLAB_REGISTRY -u $GITLAB_USER_LOGIN -p $GITLAB_SUPPORT_TOKEN
+    - docker pull $GITLAB_REGISTRY/$GITLAB_PREFIX:$IMAGE_TAG
+    - docker logout $GITLAB_REGISTRY
+    - >
+      aws ecr get-login-password
+      --region $AWS_DEFAULT_REGION
+      | docker login $REGISTRY
+      --username AWS
+      --password-stdin
+    - docker tag $GITLAB_REGISTRY/$GITLAB_PREFIX:$IMAGE_TAG $REGISTRY/$SERVICE_NAME-$CI_ENVIRONMENT_SLUG:$IMAGE_TAG
+    - docker push $REGISTRY/$SERVICE_NAME-$CI_ENVIRONMENT_SLUG:$IMAGE_TAG
+    - docker logout $REGISTRY
+
+publish dev:
+  needs: [build dev]
+  stage: publish dev
+  extends:
+    - ._dev
+    - ._publish
+
+
+._deploy_helm:
+  variables:
+    MODULE_DIR : deploy
+  before_script:
+    - aws eks update-kubeconfig --name $CLUSTER_NAME
+    - git clone --depth 50 https://gitlab-ci-token:$GITLAB_SUPPORT_TOKEN@$CI_SERVER_HOST/$CI_PATH.git $(basename $CI_PATH)
+    - cd $CI_PROJECT_DIR
+    - mv $(basename $CI_PATH)/terraform/$MODULE_DIR/helm .
+    - mv values.yaml helm
+    - mv Chart.yaml helm
+    - cd helm
+  script:
+    - >
+      helm upgrade $SERVICE_NAME . --install --create-namespace
+      --namespace $SERVICE_NAME-$CI_ENVIRONMENT_SLUG
+      --set secrets.secrets.aws_access_key_id=$AWS_ACCESS_KEY_ID
+      --set secrets.secrets.aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+      --set secrets.secrets.dd_api_key=$DATADOG_API_KEY
+      --set secrets.secrets.dd_app_key=$DATADOG_APP_KEY
+      --set secrets.secrets.dd_service=$SERVICE_NAME
+
+._destroy_helm:
+  when: manual
+  before_script:
+    - aws eks update-kubeconfig --name $CLUSTER_NAME
+  script:
+    - helm uninstall $SERVICE_NAME -n $SERVICE_NAME-$CI_ENVIRONMENT_SLUG
+    - kubectl delete ns $SERVICE_NAME-$CI_ENVIRONMENT_SLUG
+
+install dev:
+  needs: [build dev, publish dev]
+  dependencies: [build dev]
+  stage: install dev
+  extends:
+    - ._dev
+    - ._deploy_helm
+  environment:
+    on_stop: destroy dev
+  
+uninstall dev:
+  needs: [build dev, publish dev]
+  stage: install dev
+  extends:
+    - ._dev
+    - ._destroy_helm
+  environment:
+    action: stop
+
+
+._terraform_monitor:
+  variables:
+    MODULE_DIR                   : monitor
+    TF_VAR_url                   : $HEALTHZ_URL
+  before_script:
+    - echo -e "credentials \"$CI_SERVER_HOST\" {\n  token = \"$ROOT_DEPLOY_TOKEN\"\n}" > ~/.terraformrc
+    - export TF_CLI_ARGS_init="-backend-config=bucket=${S3_BUCKET_BACKEND}"
+    - export TF_CLI_ARGS_init="${TF_CLI_ARGS_init} -backend-config=key=${CI_PROJECT_NAME}-${MODULE_DIR}-${CI_ENVIRONMENT_SLUG}"
+    - export TF_CLI_ARGS_init="${TF_CLI_ARGS_init} -backend-config=region=${AWS_DEFAULT_REGION}"
+    - git clone --depth 50 https://gitlab-ci-token:$GITLAB_SUPPORT_TOKEN@$CI_SERVER_HOST/$CI_PATH.git $(basename $CI_PATH)
+    - cd $(basename $CI_PATH)/terraform/$MODULE_DIR
+    - terraform init
+    - terraform validate
+
+._deploy_monitor:
+  extends: ._terraform_monitor
+  script:
+    - terraform plan -out "planfile"
+    - terraform apply -input=false "planfile"
+
+._destroy_monitor:
+  extends: ._terraform_monitor
+  script:
+    - terraform destroy -auto-approve
+
+monitor dev:
+  needs: [install dev]
+  stage: monitor dev
+  extends:
+    - ._dev
+    - ._deploy_monitor
+  environment:
+    on_stop: de-monitor dev
+  
+de-monitor dev:
+  needs: [install dev]
+  when: manual
+  stage: monitor dev
+  extends:
+    - ._dev
+    - ._destroy_monitor
+  environment:
+    action: stop
+
+
+build prod:
+  when: manual
+  stage: build prod
+  extends:
+    - ._prod
+    - ._build_terraform
+  environment:
+    on_stop: destroy prod
+  
+destroy prod:
+  stage: build prod
+  extends:
+    - ._prod
+    - ._destroy_terraform
+  environment:
+    action: stop
+
+publish prod:
+  needs: [build prod]
+  stage: publish prod
+  extends:
+    - ._prod
+    - ._publish
+
+install prod:
+  needs: [build prod, publish prod]
+  dependencies: [build prod]
+  stage: install prod
+  extends:
+    - ._prod
+    - ._deploy_helm
+  environment:
+    on_stop: destroy prod
+  
+uninstall prod:
+  needs: [build prod, publish prod]
+  stage: install prod
+  extends:
+    - ._prod
+    - ._destroy_helm
+  environment:
+    action: stop
+
+monitor prod:
+  needs: [install prod]
+  stage: monitor prod
+  extends:
+    - ._prod
+    - ._deploy_monitor
+  environment:
+    on_stop: de-monitor prod
+  
+de-monitor prod:
+  needs: [install prod]
+  when: manual
+  stage: monitor prod
+  extends:
+    - ._prod
+    - ._destroy_monitor
+  environment:
+    action: stop

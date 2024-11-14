@@ -1,0 +1,30 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+    name: {{ .Values.autoscaler.name }}
+spec:
+    scaleTargetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: {{ .Values.deployment.name }}
+    minReplicas: {{ .Values.autoscaler.minReplicas }}
+    maxReplicas: {{ .Values.autoscaler.maxReplicas }}
+    metrics:
+        - type: External
+          external:
+              metric:
+                name: {{ .Values.autoscaler.metricName }}
+              target:
+                type: AverageValue
+                averageValue: {{ .Values.autoscaler.scaleTarget }}
+    behavior:
+        scaleUp:
+            policies:
+                - type: {{ .Values.autoscaler.behavior.scaleUp.type }}
+                  value: {{ .Values.autoscaler.behavior.scaleUp.value }}
+                  periodSeconds: {{ .Values.autoscaler.behavior.scaleUp.periodSeconds }}
+        scaleDown:
+            policies:
+                - type: {{ .Values.autoscaler.behavior.scaleDown.type }}
+                  value: {{ .Values.autoscaler.behavior.scaleDown.value }}
+                  periodSeconds: {{ .Values.autoscaler.behavior.scaleDown.periodSeconds }}
